@@ -23,6 +23,7 @@ class Review:
     title: str = ""
     author: str = ""
     pages: str = ""
+    days_taken: str = ""
     rating: float = 0.0
     review_text: str = ""
     cover_image: str | None = None
@@ -44,6 +45,7 @@ class Review:
             "title": self.title,
             "author": self.author,
             "pages": self.pages,
+            "days_taken": self.days_taken,
             "rating": self.rating,
             "review_text": self.review_text,
             "cover_image": self.cover_image,
@@ -64,6 +66,7 @@ class Review:
             title=d.get("title") or "",
             author=d.get("author") or "",
             pages=str(d.get("pages") or ""),
+            days_taken=str(d.get("days_taken") or ""),
             rating=float(d.get("rating") or 0),
             review_text=d.get("review_text") or "",
             cover_image=d.get("cover_image"),

@@ -367,12 +367,21 @@ def _draw_field(draw, x, y, w, label, value, spec, value_font_size=40) -> float:
 
 
 def _fields_font_size(draw, review) -> int:
-    """Shrink the value font until title/author/pages + rating fit in 540px."""
+    """Shrink the value font until title/author/pages+days + rating fit in 540px."""
     for size in (40, 36, 32, 28):
         vf = gelasio(size)
         total = 0.0
-        for value, w in ((review.title, FIELDS_W), (review.author, FIELDS_W), (review.pages, FIELDS_W * 0.46)):
-            nlines = len(_wrap(draw, value, vf, w)) if value else 1
+        # pages and days share one row, so only the taller of the two counts
+        row_lines = max(
+            len(_wrap(draw, review.pages, vf, FIELDS_W * 0.46)) if review.pages else 1,
+            len(_wrap(draw, review.days_taken, vf, FIELDS_W * 0.46)) if review.days_taken else 1,
+        )
+        for value, w, forced in (
+            (review.title, FIELDS_W, None),
+            (review.author, FIELDS_W, None),
+            (None, FIELDS_W * 0.46, row_lines),
+        ):
+            nlines = forced or (len(_wrap(draw, value, vf, w)) if value else 1)
             total += 23 * 1.3 + 4 + nlines * size * 1.25 + 14
         total += 2 * 20  # gaps between fields
         rating_h = 23 * 1.3 + 8 + 60
@@ -425,7 +434,12 @@ def render_review(
     fy = row_y
     fy = _draw_field(draw, FIELDS_X, fy, FIELDS_W, "TITLE", review.title, spec, fsize) + 20
     fy = _draw_field(draw, FIELDS_X, fy, FIELDS_W, "AUTHOR", review.author, spec, fsize) + 20
-    _draw_field(draw, FIELDS_X, fy, round(FIELDS_W * 0.46), "PAGES", review.pages, spec, fsize)
+    half_w = round(FIELDS_W * 0.46)
+    _draw_field(draw, FIELDS_X, fy, half_w, "PAGES", review.pages, spec, fsize)
+    _draw_field(
+        draw, FIELDS_X + FIELDS_W - half_w, fy, half_w, "DAYS TAKEN",
+        review.days_taken, spec, fsize,
+    )
 
     stars_y = row_y + COVER_H - 56
     _draw_label(draw, FIELDS_X, stars_y - 8 - 30, "MY RATING", spec)

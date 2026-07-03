@@ -7,6 +7,7 @@ create table if not exists public.reviews (
     title text not null default '',
     author text not null default '',
     pages text not null default '',
+    days_taken text not null default '',
     rating numeric(2, 1) not null default 0,
     review_text text not null default '',
     cover_image text,
@@ -14,6 +15,9 @@ create table if not exists public.reviews (
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now()
 );
+
+-- Upgrades an already-created table (safe to re-run; does nothing if present).
+alter table public.reviews add column if not exists days_taken text not null default '';
 
 -- Single-user app accessed only with the service role key, so RLS stays
 -- enabled with no policies: anon/authenticated keys can read nothing.

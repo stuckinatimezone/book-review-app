@@ -4,7 +4,7 @@
     {
       "name": "book-review-web",
       "runtimeExecutable": "sh",
-      "runtimeArgs": ["-c", "PORT=8550 .venv/bin/python main.py"],
+      "runtimeArgs": ["-c", "PORT=8550 APP_PASSWORD= .venv/bin/python main.py"],
       "port": 8550
     }
   ]

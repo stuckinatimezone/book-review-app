@@ -56,30 +56,35 @@ class LocalStore:
                 cover_image TEXT,
                 aesthetic_images TEXT DEFAULT '[]',
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                days_taken TEXT DEFAULT ''
             )
             """
         )
+        existing = {r[1] for r in self._db.execute("PRAGMA table_info(reviews)")}
+        if "days_taken" not in existing:
+            self._db.execute("ALTER TABLE reviews ADD COLUMN days_taken TEXT DEFAULT ''")
         self._db.commit()
 
+    COLS = (
+        "id", "template_key", "title", "author", "pages", "days_taken", "rating",
+        "review_text", "cover_image", "aesthetic_images", "created_at", "updated_at",
+    )
+
     def _row_to_review(self, row) -> Review:
-        cols = [
-            "id", "template_key", "title", "author", "pages", "rating",
-            "review_text", "cover_image", "aesthetic_images", "created_at", "updated_at",
-        ]
-        return Review.from_dict(dict(zip(cols, row)))
+        return Review.from_dict(dict(zip(self.COLS, row)))
 
     def list_reviews(self) -> list[Review]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT * FROM reviews ORDER BY updated_at DESC"
+                f"SELECT {', '.join(self.COLS)} FROM reviews ORDER BY updated_at DESC"
             ).fetchall()
         return [self._row_to_review(r) for r in rows]
 
     def get_review(self, review_id: str) -> Review | None:
         with self._lock:
             row = self._db.execute(
-                "SELECT * FROM reviews WHERE id = ?", (review_id,)
+                f"SELECT {', '.join(self.COLS)} FROM reviews WHERE id = ?", (review_id,)
             ).fetchone()
         return self._row_to_review(row) if row else None
 
@@ -89,15 +94,15 @@ class LocalStore:
         with self._lock:
             self._db.execute(
                 """
-                INSERT INTO reviews (id, template_key, title, author, pages, rating,
-                    review_text, cover_image, aesthetic_images, created_at, updated_at)
-                VALUES (:id, :template_key, :title, :author, :pages, :rating,
-                    :review_text, :cover_image, :aesthetic_images, :created_at, :updated_at)
+                INSERT INTO reviews (id, template_key, title, author, pages, days_taken,
+                    rating, review_text, cover_image, aesthetic_images, created_at, updated_at)
+                VALUES (:id, :template_key, :title, :author, :pages, :days_taken,
+                    :rating, :review_text, :cover_image, :aesthetic_images, :created_at, :updated_at)
                 ON CONFLICT(id) DO UPDATE SET
                     template_key=:template_key, title=:title, author=:author,
-                    pages=:pages, rating=:rating, review_text=:review_text,
-                    cover_image=:cover_image, aesthetic_images=:aesthetic_images,
-                    updated_at=:updated_at
+                    pages=:pages, days_taken=:days_taken, rating=:rating,
+                    review_text=:review_text, cover_image=:cover_image,
+                    aesthetic_images=:aesthetic_images, updated_at=:updated_at
                 """,
                 d,
             )
@@ -241,6 +246,12 @@ class SupabaseStore:
         if r.is_error:
             if r.status_code == 404 and "PGRST205" in r.text:
                 raise StoreError(SCHEMA_SQL_HINT)
+            if "PGRST204" in r.text and "days_taken" in r.text:
+                raise StoreError(
+                    "The Supabase table needs one new column. In the SQL Editor run: "
+                    "alter table public.reviews add column if not exists "
+                    "days_taken text not null default '';"
+                )
             raise StoreError(f"Supabase error {r.status_code}: {r.text[:200]}")
 
 

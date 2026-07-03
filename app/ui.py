@@ -567,6 +567,7 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
     title_f = text_field("Title", review.title, "title")
     author_f = text_field("Author", review.author, "author")
     pages_f = text_field("Pages", review.pages, "pages", width=140)
+    days_f = text_field("Days to finish", review.days_taken, "days_taken", width=160)
     review_f = text_field(
         "My review", review.review_text, "review_text", multiline=True, min_lines=5, max_lines=12
     )
@@ -801,7 +802,7 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
             ft.Container(height=4),
             title_f,
             author_f,
-            pages_f,
+            ft.Row([pages_f, days_f], spacing=12),
             ft.Container(height=8),
             body_text("MY RATING", 12, MUTED),
             ft.Row([stars_row, rating_label], vertical_alignment=ft.CrossAxisAlignment.CENTER),
