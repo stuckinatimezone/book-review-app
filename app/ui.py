@@ -49,6 +49,8 @@ class Ctx:
     # set by main(): rebuilds the view for the current route (page.go is a
     # no-op when the route doesn't change, e.g. after login on "/")
     rebuild: object = None
+    # set by main(): drops cached views so they rebuild with fresh data
+    invalidate: object = None
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +67,54 @@ def body_text(text: str, size: int = 15, color: str = BODY) -> ft.Text:
 
 
 def snack(page: ft.Page, msg: str) -> None:
-    page.show_dialog(ft.SnackBar(msg))
+    page.show_dialog(ft.SnackBar(msg, duration=2600))
+
+
+# ---- entrance animations ---------------------------------------------------
+
+_EASE_OUT = ft.AnimationCurve.EASE_OUT_CUBIC
+
+
+def prep_reveal(control, dy: float = 0.04, dur: int = 420):
+    """Prepare a control to fade-and-rise in; play_reveal() triggers it."""
+    control.opacity = 0
+    control.offset = (0, dy)
+    control.animate_opacity = ft.Animation(dur, _EASE_OUT)
+    control.animate_offset = ft.Animation(dur + 80, _EASE_OUT)
+    return control
+
+
+async def play_reveal(view: ft.View) -> None:
+    """Run the staggered entrance for controls registered on a view.
+
+    Called by main() right after the view appears; each view registers its
+    entrance sequence in ``view._reveal`` (consumed on first show, so
+    navigating back to a cached view doesn't replay it).
+    """
+    controls = getattr(view, "_reveal", None)
+    if not controls:
+        return
+    view._reveal = None
+    await asyncio.sleep(0.05)
+    for c in controls:
+        c.opacity = 1
+        c.offset = (0, 0)
+        try:
+            c.update()
+        except Exception:  # noqa: BLE001 — view already gone; stop quietly
+            return
+        await asyncio.sleep(0.055)
+
+
+def hoverable(control, on_change, on_tap=None) -> ft.GestureDetector:
+    """Wrap a control so it reacts to pointer enter/exit with a hand cursor."""
+    return ft.GestureDetector(
+        content=control,
+        mouse_cursor=ft.MouseCursor.CLICK,
+        on_enter=lambda e: on_change(True),
+        on_exit=lambda e: on_change(False),
+        on_tap=on_tap,
+    )
 
 
 def normalize_image(data: bytes) -> bytes:
@@ -148,16 +197,32 @@ def build_login(ctx: Ctx) -> ft.View:
         width=280,
         autofocus=True,
         border_color=MUTED,
+        border_radius=10,
     )
     error = body_text("", 13, "#A9464F")
+    error.animate_opacity = ft.Animation(200, _EASE_OUT)
+
+    async def shake(control):
+        control.animate_offset = ft.Animation(60, ft.AnimationCurve.EASE_IN_OUT)
+        for dx in (0.02, -0.016, 0.01, 0):
+            control.offset = (dx, 0)
+            control.update()
+            await asyncio.sleep(0.06)
+        control.animate_offset = ft.Animation(500, _EASE_OUT)
 
     async def submit(e):
         if (pw.value or "").strip() == ctx.password:
             ctx.authed = True
+            # let the card breathe out before the library slides in
+            card.opacity = 0
+            card.scale = 0.97
+            card.update()
+            await asyncio.sleep(0.24)
             await ctx.rebuild()
         else:
             error.value = "That's not it — try again."
             error.update()
+            await shake(card)
 
     pw.on_submit = submit
     card = ft.Container(
@@ -177,10 +242,13 @@ def build_login(ctx: Ctx) -> ft.View:
         padding=ft.Padding.symmetric(vertical=48, horizontal=56),
         width=420,
         bgcolor=CARD,
-        border_radius=18,
+        border_radius=22,
         border=ft.Border.all(1, "#E2D5C3"),
+        shadow=ft.BoxShadow(blur_radius=30, color="#14201710", offset=ft.Offset(0, 10)),
+        animate_scale=ft.Animation(240, _EASE_OUT),
     )
-    return ft.View(
+    prep_reveal(card, dy=0.03, dur=500)
+    view = ft.View(
         route="/login",
         controls=[
             ft.SafeArea(
@@ -190,6 +258,8 @@ def build_login(ctx: Ctx) -> ft.View:
         ],
         bgcolor=BG,
     )
+    view._reveal = [card]
+    return view
 
 
 # ---------------------------------------------------------------------------
@@ -239,34 +309,43 @@ def _book_tile(ctx: Ctx, review: Review, cover: bytes | None) -> ft.Control:
         )
 
     async def open_actions(e):
-        await _book_dialog(ctx, review)
+        await _book_dialog(ctx, review, cover)
+
+    lift = ft.Container(
+        content=face,
+        border_radius=6,
+        shadow=ft.BoxShadow(blur_radius=10, color="#33000000", offset=ft.Offset(2, 4)),
+        tooltip=review.title or "Untitled",
+        animate_scale=ft.Animation(220, _EASE_OUT),
+        animate_offset=ft.Animation(220, _EASE_OUT),
+        animate=ft.Animation(220, _EASE_OUT),
+    )
+
+    def hover(entered: bool):
+        lift.scale = 1.04 if entered else 1.0
+        lift.offset = (0, -0.016) if entered else (0, 0)
+        lift.shadow = (
+            ft.BoxShadow(blur_radius=20, color="#40000000", offset=ft.Offset(2, 9))
+            if entered
+            else ft.BoxShadow(blur_radius=10, color="#33000000", offset=ft.Offset(2, 4))
+        )
+        lift.update()
 
     return ft.Container(
         content=ft.Column(
-            [
-                ft.Container(
-                    content=face,
-                    border_radius=6,
-                    shadow=ft.BoxShadow(
-                        blur_radius=10, color="#33000000", offset=ft.Offset(2, 4)
-                    ),
-                    on_click=open_actions,
-                    tooltip=review.title or "Untitled",
-                ),
-                ft.Container(height=2),
-            ],
+            [hoverable(lift, hover, on_tap=open_actions), ft.Container(height=2)],
             tight=True,
         ),
     )
 
 
-async def _book_dialog(ctx: Ctx, review: Review) -> None:
+async def _book_dialog(ctx: Ctx, review: Review, cover: bytes | None = None) -> None:
     spec = get_template(review.template_key)
     page = ctx.page
 
     async def do_edit(e):
         page.pop_dialog()
-        page.go(f"/edit/{review.id}")
+        await page.push_route(f"/edit/{review.id}")
 
     async def do_export(e):
         page.pop_dialog()
@@ -284,11 +363,12 @@ async def _book_dialog(ctx: Ctx, review: Review) -> None:
                 snack(page, str(err))
                 return
             snack(page, "Review removed from your shelf.")
+            if ctx.invalidate:
+                ctx.invalidate("/")
             await ctx.rebuild()
 
         page.show_dialog(
             ft.AlertDialog(
-                modal=True,
                 title=ft.Text("Delete this review?", font_family="Gelasio SemiBold"),
                 content=body_text(f"“{review.title or 'Untitled'}” will be gone for good."),
                 actions=[
@@ -298,11 +378,36 @@ async def _book_dialog(ctx: Ctx, review: Review) -> None:
             )
         )
 
-    meta = f"{spec.name}  ·  {'★' * int(review.rating)}{'½' if review.rating % 1 else ''}"
+    if cover:
+        mini = ft.Image(
+            src=_thumb(cover, 168, 240), width=56, height=84,
+            fit=ft.BoxFit.COVER, border_radius=6,
+        )
+    else:
+        mini = ft.Container(width=56, height=84, border_radius=6, bgcolor=spec.accent)
+    details = ft.Column(
+        [
+            body_text(spec.name.upper(), 11, spec.label),
+            ft.Row(rating_icons(review.rating, spec.accent, 18), spacing=1),
+            body_text(
+                "  ·  ".join(
+                    p for p in (
+                        review.author,
+                        f"{review.pages} pages" if review.pages else "",
+                    ) if p
+                ) or "No details yet",
+                13,
+                MUTED,
+            ),
+        ],
+        spacing=6,
+        tight=True,
+        alignment=ft.MainAxisAlignment.CENTER,
+    )
     page.show_dialog(
         ft.AlertDialog(
             title=ft.Text(review.title or "Untitled", font_family="Gelasio SemiBold"),
-            content=body_text(meta, 14, MUTED),
+            content=ft.Row([mini, details], spacing=16, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             actions=[
                 ft.TextButton("Delete", on_click=do_delete),
                 ft.OutlinedButton("Export PNG", on_click=do_export),
@@ -367,12 +472,15 @@ def build_library(ctx: Ctx) -> ft.View:
         spacing=2,
         tight=True,
     )
+    async def go_templates(e):
+        await page.push_route("/templates")
+
     new_btn = ft.FilledButton(
         "New review",
         icon=ft.Icons.ADD,
         bgcolor=MUTED,
         color="#FFFFFF",
-        on_click=lambda e: page.go("/templates"),
+        on_click=go_templates,
     )
     if narrow:
         header = ft.Column([title_block, new_btn], spacing=14, tight=True)
@@ -412,9 +520,7 @@ def build_library(ctx: Ctx) -> ft.View:
                         heading("Your shelf is empty", 24, MUTED),
                         body_text("Pick a template and write your first review.", 14, MUTED),
                         ft.Container(height=10),
-                        ft.OutlinedButton(
-                            "Browse templates", on_click=lambda e: page.go("/templates")
-                        ),
+                        ft.OutlinedButton("Browse templates", on_click=go_templates),
                     ],
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     tight=True,
@@ -426,12 +532,18 @@ def build_library(ctx: Ctx) -> ft.View:
     else:
         content.append(ft.Column(shelves, spacing=44))
 
-    return ft.View(
+    # staggered entrance: header first, then each shelf rises into place
+    reveal = [prep_reveal(header, dy=0.02)]
+    reveal += [prep_reveal(s, dy=0.03) for s in shelves[:6]]
+    if not shelves:
+        reveal.append(prep_reveal(content[-1], dy=0.03))
+
+    view = ft.View(
         route="/",
         controls=[
             ft.SafeArea(
                 content=ft.Container(
-                    content=ft.Column(content, scroll=ft.ScrollMode.AUTO, expand=True),
+                    content=ft.Column(content, scroll=ft.ScrollMode.HIDDEN, expand=True),
                     padding=ft.Padding.symmetric(vertical=24 if narrow else 36, horizontal=side_pad),
                     expand=True,
                 ),
@@ -440,6 +552,8 @@ def build_library(ctx: Ctx) -> ft.View:
         ],
         bgcolor=BG,
     )
+    view._reveal = reveal
+    return view
 
 
 # ---------------------------------------------------------------------------
@@ -454,61 +568,74 @@ def build_picker(ctx: Ctx) -> ft.View:
         async def handler(e):
             review = Review.new(key)
             ctx.drafts[review.id] = (review, {})
-            page.go(f"/edit/{review.id}")
+            await page.push_route(f"/edit/{review.id}")
 
         return handler
 
     cards = []
     for key, spec in TEMPLATES.items():
         thumb = renderer.blank_template_jpeg(key)
-        cards.append(
-            ft.Container(
-                content=ft.Column(
-                    [
-                        ft.Container(
-                            content=ft.Image(src=thumb, width=227, border_radius=10),
-                            border_radius=10,
-                            shadow=ft.BoxShadow(blur_radius=8, color="#26000000", offset=ft.Offset(0, 3)),
-                        ),
-                        ft.Container(height=6),
-                        ft.Text(spec.name, font_family="Gelasio SemiBold", size=16, color=INK),
-                        body_text("1080 × 1920", 12, MUTED),
-                    ],
-                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    tight=True,
-                    spacing=2,
-                ),
-                on_click=pick(key),
-                width=259,
-                padding=14,
-                border_radius=14,
-                bgcolor=CARD,
-                border=ft.Border.all(1, "#E7DCCB"),
-                tooltip=f"Start a {spec.name} review",
-            )
+        card = ft.Container(
+            content=ft.Column(
+                [
+                    ft.Container(
+                        content=ft.Image(src=thumb, width=227, border_radius=10),
+                        border_radius=10,
+                        shadow=ft.BoxShadow(blur_radius=8, color="#26000000", offset=ft.Offset(0, 3)),
+                    ),
+                    ft.Container(height=6),
+                    ft.Text(spec.name, font_family="Gelasio SemiBold", size=16, color=INK),
+                    body_text("1080 × 1920", 12, MUTED),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                tight=True,
+                spacing=2,
+            ),
+            width=259,
+            padding=14,
+            border_radius=14,
+            bgcolor=CARD,
+            border=ft.Border.all(1, "#E7DCCB"),
+            tooltip=f"Start a {spec.name} review",
+            animate_scale=ft.Animation(200, _EASE_OUT),
+            animate=ft.Animation(200, _EASE_OUT),
         )
 
-    return ft.View(
+        def hover(entered: bool, c=card, accent=spec.accent):
+            c.scale = 1.025 if entered else 1.0
+            c.border = ft.Border.all(1.2, accent if entered else "#E7DCCB")
+            c.shadow = (
+                ft.BoxShadow(blur_radius=18, color="#26000000", offset=ft.Offset(0, 8))
+                if entered
+                else None
+            )
+            c.update()
+
+        cards.append(hoverable(card, hover, on_tap=pick(key)))
+
+    async def go_home(e):
+        await page.push_route("/")
+
+    header = ft.Row(
+        [
+            ft.IconButton(ft.Icons.ARROW_BACK, icon_color=MUTED, on_click=go_home),
+            heading("Pick a template"),
+        ],
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+    )
+    view = ft.View(
         route="/templates",
         controls=[
             ft.SafeArea(
                 content=ft.Container(
                     content=ft.Column(
                         [
-                            ft.Row(
-                                [
-                                    ft.IconButton(
-                                        ft.Icons.ARROW_BACK, icon_color=MUTED, on_click=lambda e: page.go("/")
-                                    ),
-                                    heading("Pick a template"),
-                                ],
-                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            ),
+                            header,
                             body_text("Each genre has its own palette and mood — the layout stays the same.", 14, MUTED),
                             ft.Container(height=18),
                             ft.Row(cards, wrap=True, spacing=22, run_spacing=22),
                         ],
-                        scroll=ft.ScrollMode.AUTO,
+                        scroll=ft.ScrollMode.HIDDEN,
                         expand=True,
                     ),
                     padding=ft.Padding.symmetric(
@@ -521,6 +648,8 @@ def build_picker(ctx: Ctx) -> ft.View:
         ],
         bgcolor=BG,
     )
+    view._reveal = [prep_reveal(header, dy=0.015)] + [prep_reveal(c, dy=0.035) for c in cards]
+    return view
 
 
 # ---------------------------------------------------------------------------
@@ -735,7 +864,15 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
             content=slot_content(slot, w, h),
             on_click=pick_slot(slot),
             tooltip=f"Set {SLOT_LABELS[slot]}",
+            animate=ft.Animation(180, _EASE_OUT),
         )
+
+        def hover(e, c=holder):
+            entered = e.data in (True, "true")
+            c.border = ft.Border.all(1.5, spec.accent if entered else "#D8C9B6")
+            c.update()
+
+        holder.on_hover = hover
         slot_holders[slot] = holder
         return holder
 
@@ -793,6 +930,8 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
         dirty["slots"].clear()
         saved_note.value = "All changes saved"
         saved_note.update()
+        if ctx.invalidate:
+            ctx.invalidate("/")  # the bookshelf needs to show this review
         snack(page, "Saved to your bookshelf.")
 
     async def do_export(e):
@@ -805,14 +944,13 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
             async def leave(e2):
                 page.pop_dialog()
                 ctx.drafts.pop(rid, None)
-                page.go("/")
+                await page.push_route("/")
 
             async def stay(e2):
                 page.pop_dialog()
 
             page.show_dialog(
                 ft.AlertDialog(
-                    modal=True,
                     title=ft.Text("Leave without saving?", font_family="Gelasio SemiBold"),
                     content=body_text("Your latest edits haven't been saved."),
                     actions=[
@@ -823,7 +961,7 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
             )
         else:
             ctx.drafts.pop(rid, None)
-            page.go("/")
+            await page.push_route("/")
 
     form_children = [
         ft.Row(
@@ -901,14 +1039,15 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
                 preview_block,
                 ft.Container(height=40),
             ],
-            scroll=ft.ScrollMode.AUTO,
+            scroll=ft.ScrollMode.HIDDEN,
             spacing=10,
             expand=True,
         )
+        reveal = [prep_reveal(body, dy=0.02)]
     else:
         form = ft.Column(
             form_children + [ft.Container(height=30)],
-            scroll=ft.ScrollMode.AUTO,
+            scroll=ft.ScrollMode.HIDDEN,
             spacing=10,
             col={"md": 6, "lg": 5},
         )
@@ -916,7 +1055,7 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
             content=ft.Column(
                 [preview_block],
                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                scroll=ft.ScrollMode.AUTO,
+                scroll=ft.ScrollMode.HIDDEN,
             ),
             alignment=ft.Alignment.TOP_CENTER,
             padding=ft.Padding.only(left=10, top=16, bottom=16),
@@ -927,8 +1066,9 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
             expand=True,
             vertical_alignment=ft.CrossAxisAlignment.START,
         )
+        reveal = [prep_reveal(form, dy=0.02), prep_reveal(preview_panel, dy=0.03)]
 
-    return ft.View(
+    view = ft.View(
         route=f"/edit/{rid}",
         controls=[
             ft.SafeArea(
@@ -944,3 +1084,5 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
         ],
         bgcolor=BG,
     )
+    view._reveal = reveal
+    return view
