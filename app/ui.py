@@ -1,0 +1,879 @@
+"""All application views: login, library (bookshelf), template picker, editor."""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import flet as ft
+from PIL import Image as PILImage
+
+from . import renderer
+from .models import Review
+from .storage import StoreError
+from .templates import TEMPLATES, TemplateSpec, get_template
+
+try:  # optional: lets Pillow open iPhone HEIC photos
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    pass
+
+# ---- app palette (matches the template family) ----------------------------
+BG = "#F6F1E7"
+INK = "#37302A"
+BODY = "#453B32"
+MUTED = "#8A7767"
+CARD = "#FFFDF8"
+WOOD_TOP = "#A98A6B"
+WOOD_BOTTOM = "#7A5C43"
+
+SLOT_LABELS = {"cover": "Book cover", "aes0": "Mood 1", "aes1": "Mood 2", "aes2": "Mood 3", "aes3": "Mood 4"}
+
+
+@dataclass
+class Ctx:
+    page: ft.Page
+    store: object
+    file_picker: ft.FilePicker
+    password: str
+    authed: bool = False
+    storage_note: str | None = None
+    # unsaved drafts: review_id -> (Review, {slot: bytes})
+    drafts: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+
+
+def heading(text: str, size: int = 34, color: str = INK) -> ft.Text:
+    return ft.Text(text, font_family="Gelasio SemiBold", size=size, color=color)
+
+
+def body_text(text: str, size: int = 15, color: str = BODY) -> ft.Text:
+    return ft.Text(text, font_family="Karla", size=size, color=color)
+
+
+def snack(page: ft.Page, msg: str) -> None:
+    page.show_dialog(ft.SnackBar(msg))
+
+
+def normalize_image(data: bytes) -> bytes:
+    """Downscale uploads and re-encode as JPEG so storage stays small."""
+    img = PILImage.open(io.BytesIO(data))
+    img = img.convert("RGB")
+    img.thumbnail((1600, 1600), PILImage.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=88)
+    return buf.getvalue()
+
+
+def load_images(store, review: Review) -> dict[str, bytes | None]:
+    images: dict[str, bytes | None] = {}
+    if review.cover_image:
+        images["cover"] = store.load_image(review.cover_image)
+    for i, key in enumerate(review.aesthetic_images):
+        if key:
+            images[f"aes{i}"] = store.load_image(key)
+    return images
+
+
+def safe_filename(review: Review) -> str:
+    spec = get_template(review.template_key)
+    name = f"{review.title or 'book-review'} — {spec.name}"
+    return re.sub(r"[^\w\s\-·–—]", "", name).strip()[:80] + ".png"
+
+
+async def export_review(ctx: Ctx, review: Review, images: dict | None = None) -> None:
+    if images is None:
+        images = await asyncio.to_thread(load_images, ctx.store, review)
+    png = await asyncio.to_thread(renderer.render_png, review, images)
+    fname = safe_filename(review)
+    try:
+        if ctx.page.web or ctx.page.platform.is_mobile():
+            await ctx.file_picker.save_file(file_name=fname, src_bytes=png)
+            snack(ctx.page, "Export started — check your downloads.")
+        else:
+            path = await ctx.file_picker.save_file(
+                dialog_title="Export review as PNG", file_name=fname
+            )
+            if path:
+                if not path.lower().endswith(".png"):
+                    path += ".png"
+                Path(path).write_bytes(png)
+                snack(ctx.page, f"Exported to {path}")
+    except Exception as e:  # noqa: BLE001 — always surface export problems
+        snack(ctx.page, f"Export failed: {e}")
+
+
+def rating_icons(rating: float, accent: str, size: int = 26) -> list[ft.Icon]:
+    icons = []
+    for i in range(5):
+        frac = rating - i
+        name = ft.Icons.STAR if frac >= 0.75 else (ft.Icons.STAR_HALF if frac > 0 else ft.Icons.STAR_BORDER)
+        icons.append(ft.Icon(name, color=accent, size=size))
+    return icons
+
+
+# ---------------------------------------------------------------------------
+# login
+# ---------------------------------------------------------------------------
+
+
+def build_login(ctx: Ctx) -> ft.View:
+    pw = ft.TextField(
+        label="Password",
+        password=True,
+        can_reveal_password=True,
+        width=280,
+        autofocus=True,
+        border_color=MUTED,
+    )
+    error = body_text("", 13, "#A9464F")
+
+    async def submit(e):
+        if pw.value == ctx.password:
+            ctx.authed = True
+            ctx.page.go("/")
+        else:
+            error.value = "That's not it — try again."
+            error.update()
+
+    pw.on_submit = submit
+    card = ft.Container(
+        content=ft.Column(
+            [
+                heading("Book Review", 40),
+                body_text("your private bookshelf", 15, MUTED),
+                ft.Container(height=18),
+                pw,
+                error,
+                ft.Container(height=6),
+                ft.FilledButton("Open the library", on_click=submit, bgcolor=MUTED, color="#FFFFFF"),
+            ],
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            tight=True,
+        ),
+        padding=ft.Padding.symmetric(vertical=48, horizontal=56),
+        bgcolor=CARD,
+        border_radius=18,
+        border=ft.Border.all(1, "#E2D5C3"),
+    )
+    return ft.View(
+        route="/login",
+        controls=[
+            ft.Container(content=card, alignment=ft.Alignment.CENTER, expand=True)
+        ],
+        bgcolor=BG,
+    )
+
+
+# ---------------------------------------------------------------------------
+# library ("the bookshelf")
+# ---------------------------------------------------------------------------
+
+BOOK_W, BOOK_H = 148, 212
+
+
+def _book_tile(ctx: Ctx, review: Review, cover: bytes | None) -> ft.Control:
+    spec = get_template(review.template_key)
+
+    if cover:
+        face = ft.Image(
+            src=cover, width=BOOK_W, height=BOOK_H, fit=ft.BoxFit.COVER, border_radius=6
+        )
+    else:
+        face = ft.Container(
+            width=BOOK_W,
+            height=BOOK_H,
+            border_radius=6,
+            gradient=ft.LinearGradient(
+                begin=ft.Alignment.CENTER_LEFT,
+                end=ft.Alignment.CENTER_RIGHT,
+                colors=[spec.label, spec.accent],
+                stops=[0.06, 0.2],
+            ),
+            padding=ft.Padding.only(left=18, top=16, right=12, bottom=12),
+            content=ft.Column(
+                [
+                    ft.Text(
+                        review.title or "Untitled",
+                        font_family="Gelasio SemiBold",
+                        size=17,
+                        color="#FFF9F2",
+                        max_lines=4,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                    ),
+                    ft.Container(expand=True),
+                    ft.Text(review.author, font_family="Karla", size=12, color="#F5EBDD"),
+                ],
+            ),
+        )
+
+    async def open_actions(e):
+        await _book_dialog(ctx, review)
+
+    return ft.Container(
+        content=ft.Column(
+            [
+                ft.Container(
+                    content=face,
+                    border_radius=6,
+                    shadow=ft.BoxShadow(
+                        blur_radius=10, color="#33000000", offset=ft.Offset(2, 4)
+                    ),
+                    on_click=open_actions,
+                    tooltip=review.title or "Untitled",
+                ),
+                ft.Container(height=2),
+            ],
+            tight=True,
+        ),
+    )
+
+
+async def _book_dialog(ctx: Ctx, review: Review) -> None:
+    spec = get_template(review.template_key)
+    page = ctx.page
+
+    async def do_edit(e):
+        page.pop_dialog()
+        page.go(f"/edit/{review.id}")
+
+    async def do_export(e):
+        page.pop_dialog()
+        snack(page, "Rendering PNG…")
+        await export_review(ctx, review)
+
+    async def do_delete(e):
+        page.pop_dialog()
+
+        async def really(e2):
+            page.pop_dialog()
+            try:
+                await asyncio.to_thread(ctx.store.delete_review, review)
+            except StoreError as err:
+                snack(page, str(err))
+                return
+            snack(page, "Review removed from your shelf.")
+            page.go("/refresh")  # cheap way to force rebuild
+            page.go("/")
+
+        page.show_dialog(
+            ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Delete this review?", font_family="Gelasio SemiBold"),
+                content=body_text(f"“{review.title or 'Untitled'}” will be gone for good."),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda e2: page.pop_dialog()),
+                    ft.FilledButton("Delete", bgcolor="#A9464F", color="#FFFFFF", on_click=really),
+                ],
+            )
+        )
+
+    meta = f"{spec.name}  ·  {'★' * int(review.rating)}{'½' if review.rating % 1 else ''}"
+    page.show_dialog(
+        ft.AlertDialog(
+            title=ft.Text(review.title or "Untitled", font_family="Gelasio SemiBold"),
+            content=body_text(meta, 14, MUTED),
+            actions=[
+                ft.TextButton("Delete", on_click=do_delete),
+                ft.OutlinedButton("Export PNG", on_click=do_export),
+                ft.FilledButton("Edit", bgcolor=MUTED, color="#FFFFFF", on_click=do_edit),
+            ],
+        )
+    )
+
+
+def _shelf(children: list[ft.Control]) -> ft.Control:
+    """A row of books standing on a wooden board."""
+    return ft.Column(
+        [
+            ft.Row(children, spacing=26, vertical_alignment=ft.CrossAxisAlignment.END),
+            ft.Container(
+                height=15,
+                border_radius=3,
+                gradient=ft.LinearGradient(
+                    begin=ft.Alignment.TOP_CENTER,
+                    end=ft.Alignment.BOTTOM_CENTER,
+                    colors=[WOOD_TOP, WOOD_BOTTOM],
+                ),
+                shadow=ft.BoxShadow(blur_radius=8, color="#40000000", offset=ft.Offset(0, 5)),
+                margin=ft.Margin.only(top=-2),
+            ),
+        ],
+        spacing=0,
+        tight=True,
+    )
+
+
+def build_library(ctx: Ctx) -> ft.View:
+    page = ctx.page
+    try:
+        reviews = ctx.store.list_reviews()
+        covers = {
+            r.id: (ctx.store.load_image(r.cover_image) if r.cover_image else None)
+            for r in reviews
+        }
+        error = None
+    except (StoreError, Exception) as e:  # noqa: BLE001
+        reviews, covers, error = [], {}, str(e)
+
+    narrow = (page.width or 1100) < 640
+    side_pad = 20 if narrow else 48
+    per_row = max(2, int(((page.width or 1100) - 2 * side_pad - 24) // (BOOK_W + 26)))
+    shelves: list[ft.Control] = []
+    for i in range(0, len(reviews), per_row):
+        row = [_book_tile(ctx, r, covers.get(r.id)) for r in reviews[i : i + per_row]]
+        shelves.append(_shelf(row))
+
+    title_block = ft.Column(
+        [
+            heading("My Library"),
+            body_text(
+                f"{len(reviews)} review{'s' if len(reviews) != 1 else ''} on the shelf"
+                + (f"  ·  {ctx.store.label}" if not error else ""),
+                13,
+                MUTED,
+            ),
+        ],
+        spacing=2,
+        tight=True,
+    )
+    new_btn = ft.FilledButton(
+        "New review",
+        icon=ft.Icons.ADD,
+        bgcolor=MUTED,
+        color="#FFFFFF",
+        on_click=lambda e: page.go("/templates"),
+    )
+    if narrow:
+        header = ft.Column([title_block, new_btn], spacing=14, tight=True)
+    else:
+        header = ft.Row(
+            [title_block, ft.Container(expand=True), new_btn],
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+    content: list[ft.Control] = [header, ft.Container(height=26)]
+    if ctx.storage_note:
+        content.append(
+            ft.Container(
+                content=body_text(ctx.storage_note, 13, "#8C6F3F"),
+                bgcolor="#F4ECDD",
+                border=ft.Border.all(1, "#D9C7A8"),
+                border_radius=10,
+                padding=12,
+                margin=ft.Margin.only(bottom=18),
+            )
+        )
+    if error:
+        content.append(
+            ft.Container(
+                content=body_text(error, 14, "#A9464F"),
+                bgcolor="#F7E9E7",
+                border=ft.Border.all(1, "#E0C2BE"),
+                border_radius=10,
+                padding=16,
+            )
+        )
+    elif not reviews:
+        content.append(
+            ft.Container(
+                content=ft.Column(
+                    [
+                        heading("Your shelf is empty", 24, MUTED),
+                        body_text("Pick a template and write your first review.", 14, MUTED),
+                        ft.Container(height=10),
+                        ft.OutlinedButton(
+                            "Browse templates", on_click=lambda e: page.go("/templates")
+                        ),
+                    ],
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    tight=True,
+                ),
+                alignment=ft.Alignment.CENTER,
+                padding=ft.Padding.symmetric(vertical=80, horizontal=20),
+            )
+        )
+    else:
+        content.append(ft.Column(shelves, spacing=44))
+
+    return ft.View(
+        route="/",
+        controls=[
+            ft.Container(
+                content=ft.Column(content, scroll=ft.ScrollMode.AUTO, expand=True),
+                padding=ft.Padding.symmetric(vertical=36, horizontal=side_pad),
+                expand=True,
+            )
+        ],
+        bgcolor=BG,
+    )
+
+
+# ---------------------------------------------------------------------------
+# template picker
+# ---------------------------------------------------------------------------
+
+
+def build_picker(ctx: Ctx) -> ft.View:
+    page = ctx.page
+
+    def pick(key: str):
+        async def handler(e):
+            review = Review.new(key)
+            ctx.drafts[review.id] = (review, {})
+            page.go(f"/edit/{review.id}")
+
+        return handler
+
+    cards = []
+    for key, spec in TEMPLATES.items():
+        thumb = renderer.blank_template_png(key, scale=0.21)
+        cards.append(
+            ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Container(
+                            content=ft.Image(src=thumb, width=227, border_radius=10),
+                            border_radius=10,
+                            shadow=ft.BoxShadow(blur_radius=8, color="#26000000", offset=ft.Offset(0, 3)),
+                        ),
+                        ft.Container(height=6),
+                        ft.Text(spec.name, font_family="Gelasio SemiBold", size=16, color=INK),
+                        body_text("1080 × 1920", 12, MUTED),
+                    ],
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    tight=True,
+                    spacing=2,
+                ),
+                on_click=pick(key),
+                width=259,
+                padding=14,
+                border_radius=14,
+                bgcolor=CARD,
+                border=ft.Border.all(1, "#E7DCCB"),
+                tooltip=f"Start a {spec.name} review",
+            )
+        )
+
+    return ft.View(
+        route="/templates",
+        controls=[
+            ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                ft.IconButton(
+                                    ft.Icons.ARROW_BACK, icon_color=MUTED, on_click=lambda e: page.go("/")
+                                ),
+                                heading("Pick a template"),
+                            ],
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                        body_text("Each genre has its own palette and mood — the layout stays the same.", 14, MUTED),
+                        ft.Container(height=18),
+                        ft.Row(cards, wrap=True, spacing=22, run_spacing=22),
+                    ],
+                    scroll=ft.ScrollMode.AUTO,
+                    expand=True,
+                ),
+                padding=ft.Padding.symmetric(
+                    vertical=36, horizontal=20 if (page.width or 1100) < 640 else 48
+                ),
+                expand=True,
+            )
+        ],
+        bgcolor=BG,
+    )
+
+
+# ---------------------------------------------------------------------------
+# editor
+# ---------------------------------------------------------------------------
+
+
+def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
+    page = ctx.page
+
+    if rid in ctx.drafts:
+        review, images = ctx.drafts[rid]
+        is_new = True
+    else:
+        review = ctx.store.get_review(rid)
+        if review is None:
+            return None
+        images = load_images(ctx.store, review)
+        ctx.drafts[rid] = (review, images)
+        is_new = False
+
+    spec = get_template(review.template_key)
+    dirty = {"changed": is_new, "slots": set()}
+
+    # --- live preview ------------------------------------------------------
+    preview = ft.Image(
+        src=renderer.render_png(review, images, scale=0.5),
+        width=min(410, (page.width or 1100) - 56),
+        border_radius=10,
+        gapless_playback=True,
+    )
+    render_seq = {"n": 0}
+
+    async def refresh_preview(delay: float = 0.3):
+        render_seq["n"] += 1
+        mine = render_seq["n"]
+        await asyncio.sleep(delay)
+        if mine != render_seq["n"]:
+            return
+        preview.src = await asyncio.to_thread(renderer.render_png, review, images, 0.5)
+        preview.update()
+
+    def mark_dirty():
+        dirty["changed"] = True
+        if saved_note.value != "Unsaved changes":
+            saved_note.value = "Unsaved changes"
+            saved_note.update()
+
+    # --- form fields ---------------------------------------------------------
+
+    def text_field(label: str, value: str, attr: str, **kw):
+        async def on_change(e):
+            setattr(review, attr, e.control.value)
+            mark_dirty()
+            await refresh_preview()
+
+        return ft.TextField(
+            label=label,
+            value=value,
+            on_change=on_change,
+            border_color="#D8C9B6",
+            focused_border_color=spec.accent,
+            label_style=ft.TextStyle(font_family="Karla", color=MUTED),
+            text_style=ft.TextStyle(font_family="Karla", color=BODY),
+            **kw,
+        )
+
+    title_f = text_field("Title", review.title, "title")
+    author_f = text_field("Author", review.author, "author")
+    pages_f = text_field("Pages", review.pages, "pages", width=140)
+    review_f = text_field(
+        "My review", review.review_text, "review_text", multiline=True, min_lines=5, max_lines=12
+    )
+
+    stars_row = ft.Row(rating_icons(review.rating, spec.accent), spacing=2)
+    rating_label = body_text(f"{review.rating:g} / 5", 14, MUTED)
+
+    async def on_rating(e):
+        review.rating = round(float(e.control.value) * 2) / 2
+        stars_row.controls = rating_icons(review.rating, spec.accent)
+        rating_label.value = f"{review.rating:g} / 5"
+        stars_row.update()
+        rating_label.update()
+        mark_dirty()
+        await refresh_preview(0.05)
+
+    rating_slider = ft.Slider(
+        value=review.rating, min=0, max=5, divisions=10,
+        active_color=spec.accent, on_change=on_rating, width=260,
+    )
+
+    # --- template switcher ---------------------------------------------------
+
+    async def on_template(e):
+        review.template_key = e.control.value
+        mark_dirty()
+        # accent colours in the form follow the template
+        nonlocal spec
+        spec = get_template(review.template_key)
+        stars_row.controls = rating_icons(review.rating, spec.accent)
+        rating_slider.active_color = spec.accent
+        stars_row.update()
+        rating_slider.update()
+        await refresh_preview(0.05)
+
+    template_dd = ft.Dropdown(
+        label="Template",
+        value=review.template_key,
+        options=[ft.DropdownOption(key=k, text=t.name) for k, t in TEMPLATES.items()],
+        on_select=on_template,
+        width=260,
+    )
+
+    # --- image slots ----------------------------------------------------------
+
+    slot_holders: dict[str, ft.Container] = {}
+
+    def slot_content(slot: str, w: int, h: int) -> ft.Control:
+        data = images.get(slot)
+        if data:
+            return ft.Stack(
+                [
+                    ft.Image(src=data, width=w, height=h, fit=ft.BoxFit.COVER, border_radius=8),
+                    ft.Container(
+                        content=ft.IconButton(
+                            ft.Icons.CLOSE,
+                            icon_size=14,
+                            icon_color="#FFFFFF",
+                            bgcolor="#66000000",
+                            on_click=remove_slot(slot),
+                            tooltip="Remove image",
+                        ),
+                        alignment=ft.Alignment.TOP_RIGHT,
+                    ),
+                ],
+                width=w,
+                height=h,
+            )
+        return ft.Column(
+            [
+                ft.Icon(ft.Icons.ADD_PHOTO_ALTERNATE_OUTLINED, color=MUTED, size=22),
+                body_text(SLOT_LABELS[slot], 11, MUTED),
+            ],
+            alignment=ft.MainAxisAlignment.CENTER,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=4,
+        )
+
+    def pick_slot(slot: str):
+        async def handler(e):
+            files = await ctx.file_picker.pick_files(
+                dialog_title=f"Choose {SLOT_LABELS[slot]}",
+                file_type=ft.FilePickerFileType.IMAGE,
+                with_data=True,
+            )
+            if not files:
+                return
+            f = files[0]
+            data = f.bytes
+            if data is None and f.path:
+                data = await asyncio.to_thread(Path(f.path).read_bytes)
+            if not data:
+                snack(page, "Couldn't read that file.")
+                return
+            try:
+                data = await asyncio.to_thread(normalize_image, data)
+            except Exception:
+                snack(page, "That doesn't look like an image I can read.")
+                return
+            images[slot] = data
+            dirty["slots"].add(slot)
+            mark_dirty()
+            refresh_slot(slot)
+            await refresh_preview(0.05)
+
+        return handler
+
+    def remove_slot(slot: str):
+        async def handler(e):
+            images[slot] = None
+            dirty["slots"].add(slot)
+            mark_dirty()
+            refresh_slot(slot)
+            await refresh_preview(0.05)
+
+        return handler
+
+    def slot_tile(slot: str, w: int, h: int) -> ft.Container:
+        holder = ft.Container(
+            width=w,
+            height=h,
+            border_radius=8,
+            bgcolor="#FFFFFF",
+            border=ft.Border.all(1.5, "#D8C9B6"),
+            alignment=ft.Alignment.CENTER,
+            content=slot_content(slot, w, h),
+            on_click=pick_slot(slot),
+            tooltip=f"Set {SLOT_LABELS[slot]}",
+        )
+        slot_holders[slot] = holder
+        return holder
+
+    def refresh_slot(slot: str):
+        holder = slot_holders[slot]
+        w, h = int(holder.width), int(holder.height)
+        holder.content = slot_content(slot, w, h)
+        holder.update()
+
+    cover_tile = slot_tile("cover", 118, 168)
+    mood_tiles = ft.Row(
+        [
+            ft.Column([slot_tile("aes0", 128, 74), slot_tile("aes2", 128, 74)], spacing=10),
+            ft.Column([slot_tile("aes1", 128, 74), slot_tile("aes3", 128, 74)], spacing=10),
+        ],
+        spacing=10,
+    )
+
+    # --- save / export ---------------------------------------------------------
+
+    saved_note = body_text("Unsaved changes" if is_new else "All changes saved", 12, MUTED)
+
+    def _persist():
+        # upload new/changed images first, then the review row
+        if "cover" in dirty["slots"]:
+            old = review.cover_image
+            review.cover_image = (
+                ctx.store.save_image(images["cover"], "jpg") if images.get("cover") else None
+            )
+            if old:
+                ctx.store.delete_image(old)
+        for i in range(4):
+            slot = f"aes{i}"
+            if slot in dirty["slots"]:
+                old = review.aesthetic_images[i]
+                review.aesthetic_images[i] = (
+                    ctx.store.save_image(images[slot], "jpg") if images.get(slot) else None
+                )
+                if old:
+                    ctx.store.delete_image(old)
+        review.touch()
+        ctx.store.save_review(review)
+
+    async def do_save(e):
+        saved_note.value = "Saving…"
+        saved_note.update()
+        try:
+            await asyncio.to_thread(_persist)
+        except (StoreError, Exception) as err:  # noqa: BLE001
+            saved_note.value = "Not saved"
+            saved_note.update()
+            snack(page, f"Save failed: {err}")
+            return
+        dirty["changed"] = False
+        dirty["slots"].clear()
+        saved_note.value = "All changes saved"
+        saved_note.update()
+        snack(page, "Saved to your bookshelf.")
+
+    async def do_export(e):
+        snack(page, "Rendering full-size PNG…")
+        await export_review(ctx, review, images)
+
+    async def go_back(e):
+        if dirty["changed"]:
+
+            async def leave(e2):
+                page.pop_dialog()
+                ctx.drafts.pop(rid, None)
+                page.go("/")
+
+            async def stay(e2):
+                page.pop_dialog()
+
+            page.show_dialog(
+                ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("Leave without saving?", font_family="Gelasio SemiBold"),
+                    content=body_text("Your latest edits haven't been saved."),
+                    actions=[
+                        ft.TextButton("Stay", on_click=stay),
+                        ft.FilledButton("Discard", bgcolor="#A9464F", color="#FFFFFF", on_click=leave),
+                    ],
+                )
+            )
+        else:
+            ctx.drafts.pop(rid, None)
+            page.go("/")
+
+    form = ft.Column(
+        [
+            ft.Row(
+                [
+                    ft.IconButton(ft.Icons.ARROW_BACK, icon_color=MUTED, on_click=go_back),
+                    heading("New review" if is_new else "Edit review", 26),
+                    ft.Container(expand=True),
+                    saved_note,
+                ],
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            ft.Container(height=8),
+            template_dd,
+            ft.Container(height=4),
+            title_f,
+            author_f,
+            pages_f,
+            ft.Container(height=8),
+            body_text("MY RATING", 12, MUTED),
+            ft.Row([stars_row, rating_label], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            rating_slider,
+            ft.Container(height=8),
+            review_f,
+            ft.Container(height=10),
+            ft.Row(
+                [
+                    ft.Column(
+                        [body_text("COVER", 12, MUTED), cover_tile], spacing=6, tight=True
+                    ),
+                    ft.Column(
+                        [body_text("THE AESTHETIC", 12, MUTED), mood_tiles], spacing=6, tight=True
+                    ),
+                ],
+                wrap=True,
+                spacing=18,
+                run_spacing=14,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            ),
+            ft.Container(height=18),
+            ft.Row(
+                [
+                    ft.FilledButton(
+                        "Save to bookshelf",
+                        icon=ft.Icons.BOOKMARK_ADDED_OUTLINED,
+                        bgcolor=MUTED,
+                        color="#FFFFFF",
+                        on_click=do_save,
+                    ),
+                    ft.OutlinedButton("Export PNG", icon=ft.Icons.IMAGE_OUTLINED, on_click=do_export),
+                ],
+                spacing=12,
+            ),
+            ft.Container(height=30),
+        ],
+        scroll=ft.ScrollMode.AUTO,
+        spacing=10,
+        col={"sm": 12, "md": 6, "lg": 5},
+    )
+
+    preview_panel = ft.Container(
+        content=ft.Column(
+            [
+                ft.Container(
+                    content=preview,
+                    border_radius=10,
+                    shadow=ft.BoxShadow(blur_radius=14, color="#30000000", offset=ft.Offset(0, 6)),
+                ),
+                ft.Container(height=6),
+                body_text("Live preview — exports at 1080 × 1920", 12, MUTED),
+            ],
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            scroll=ft.ScrollMode.AUTO,
+        ),
+        alignment=ft.Alignment.TOP_CENTER,
+        padding=ft.Padding.only(left=10, top=16, bottom=16),
+        col={"sm": 12, "md": 6, "lg": 7},
+    )
+
+    return ft.View(
+        route=f"/edit/{rid}",
+        controls=[
+            ft.Container(
+                content=ft.ResponsiveRow(
+                    [form, preview_panel],
+                    expand=True,
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                ),
+                padding=ft.Padding.symmetric(
+                    vertical=24, horizontal=16 if (page.width or 1100) < 640 else 40
+                ),
+                expand=True,
+            )
+        ],
+        bgcolor=BG,
+    )

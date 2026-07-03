@@ -1,0 +1,107 @@
+"""Book Review App — entry point.
+
+Run locally (desktop window):   python main.py
+Run as a web app:               PORT=8550 python main.py
+Railway runs it the same way (PORT is provided by the platform).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import threading
+
+from pathlib import Path
+
+import flet as ft
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+from app import ui  # noqa: E402
+from app.storage import StoreError, get_store  # noqa: E402
+
+_store_lock = threading.Lock()
+_store_cache: dict = {}
+
+
+def _store_once():
+    """Create the storage backend once per process."""
+    with _store_lock:
+        if "store" not in _store_cache:
+            try:
+                store, note = get_store()
+            except (StoreError, Exception) as e:  # noqa: BLE001
+                store, note = None, str(e)
+            _store_cache["store"] = store
+            _store_cache["note"] = note
+    return _store_cache["store"], _store_cache["note"]
+
+
+async def main(page: ft.Page):
+    page.title = "Book Review App"
+    page.bgcolor = ui.BG
+    page.padding = 0
+    page.fonts = {
+        "Gelasio": "/fonts/Gelasio-Regular.ttf",
+        "Gelasio SemiBold": "/fonts/Gelasio-SemiBold.ttf",
+        "Karla": "/fonts/Karla-Regular.ttf",
+        "Karla Bold": "/fonts/Karla-Bold.ttf",
+    }
+    try:
+        page.theme = ft.Theme(font_family="Karla", color_scheme_seed="#8A7767")
+    except Exception:
+        pass
+
+    store, note = await asyncio.to_thread(_store_once)
+
+    picker = ft.FilePicker()
+    page.services.append(picker)
+
+    ctx = ui.Ctx(
+        page=page,
+        store=store,
+        file_picker=picker,
+        password=os.getenv("APP_PASSWORD", "").strip(),
+        storage_note=note,
+    )
+
+    async def route_change(e=None):
+        route = page.route or "/"
+        if ctx.password and not ctx.authed:
+            page.views = [ui.build_login(ctx)]
+            page.update()
+            return
+
+        troute = ft.TemplateRoute(route)
+        if troute.match("/templates"):
+            view = await asyncio.to_thread(ui.build_picker, ctx)
+        elif troute.match("/edit/:rid"):
+            view = await asyncio.to_thread(ui.build_editor, ctx, troute.rid)
+            if view is None:
+                ui.snack(page, "That review no longer exists.")
+                view = await asyncio.to_thread(ui.build_library, ctx)
+        elif troute.match("/refresh"):
+            return  # transient route used to force a library rebuild
+        else:
+            view = await asyncio.to_thread(ui.build_library, ctx)
+        page.views = [view]
+        page.update()
+
+    async def resized(e):
+        # reflow the bookshelf when the window size changes
+        if (page.route or "/") == "/" and (not ctx.password or ctx.authed):
+            await route_change()
+
+    page.on_route_change = route_change
+    page.on_resized = resized
+    await route_change()
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT") or 0)
+    if port:
+        os.environ.setdefault("FLET_FORCE_WEB_SERVER", "true")
+        ft.run(main, host="0.0.0.0", port=port, view=ft.AppView.WEB_BROWSER, assets_dir="assets")
+    else:
+        ft.run(main, assets_dir="assets")
