@@ -45,6 +45,9 @@ class Ctx:
     storage_note: str | None = None
     # unsaved drafts: review_id -> (Review, {slot: bytes})
     drafts: dict = field(default_factory=dict)
+    # set by main(): rebuilds the view for the current route (page.go is a
+    # no-op when the route doesn't change, e.g. after login on "/")
+    rebuild: object = None
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +141,9 @@ def build_login(ctx: Ctx) -> ft.View:
     error = body_text("", 13, "#A9464F")
 
     async def submit(e):
-        if pw.value == ctx.password:
+        if (pw.value or "").strip() == ctx.password:
             ctx.authed = True
-            ctx.page.go("/")
+            await ctx.rebuild()
         else:
             error.value = "That's not it — try again."
             error.update()
@@ -161,6 +164,7 @@ def build_login(ctx: Ctx) -> ft.View:
             tight=True,
         ),
         padding=ft.Padding.symmetric(vertical=48, horizontal=56),
+        width=420,
         bgcolor=CARD,
         border_radius=18,
         border=ft.Border.all(1, "#E2D5C3"),
@@ -262,8 +266,7 @@ async def _book_dialog(ctx: Ctx, review: Review) -> None:
                 snack(page, str(err))
                 return
             snack(page, "Review removed from your shelf.")
-            page.go("/refresh")  # cheap way to force rebuild
-            page.go("/")
+            await ctx.rebuild()
 
         page.show_dialog(
             ft.AlertDialog(

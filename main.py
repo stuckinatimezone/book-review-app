@@ -84,12 +84,12 @@ async def main(page: ft.Page):
             if view is None:
                 ui.snack(page, "That review no longer exists.")
                 view = await asyncio.to_thread(ui.build_library, ctx)
-        elif troute.match("/refresh"):
-            return  # transient route used to force a library rebuild
         else:
             view = await asyncio.to_thread(ui.build_library, ctx)
         page.views = [view]
         page.update()
+
+    ctx.rebuild = route_change
 
     async def resized(e):
         # reflow the bookshelf when the window size changes
