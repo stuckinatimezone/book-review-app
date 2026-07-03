@@ -91,8 +91,16 @@ async def main(page: ft.Page):
 
     ctx.rebuild = route_change
 
+    last_width = {"w": page.width or 0}
+
     async def resized(e):
-        # reflow the bookshelf when the window size changes
+        # Reflow the bookshelf when the window width really changes. iOS
+        # Safari fires resize constantly as its toolbar hides/shows while
+        # scrolling — rebuilding then would make scrolling feel broken.
+        w = page.width or 0
+        if abs(w - last_width["w"]) < 60:
+            return
+        last_width["w"] = w
         if (page.route or "/") == "/" and (not ctx.password or ctx.authed):
             await route_change()
 

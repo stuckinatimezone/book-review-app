@@ -6,6 +6,7 @@ import asyncio
 import io
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import flet as ft
@@ -74,6 +75,16 @@ def normalize_image(data: bytes) -> bytes:
     img.thumbnail((1600, 1600), PILImage.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=88)
+    return buf.getvalue()
+
+
+@lru_cache(maxsize=256)
+def _thumb(data: bytes, max_w: int, max_h: int) -> bytes:
+    """Small JPEG for on-screen tiles, so phones never download full images."""
+    img = PILImage.open(io.BytesIO(data)).convert("RGB")
+    img.thumbnail((max_w, max_h), PILImage.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=80)
     return buf.getvalue()
 
 
@@ -172,7 +183,10 @@ def build_login(ctx: Ctx) -> ft.View:
     return ft.View(
         route="/login",
         controls=[
-            ft.Container(content=card, alignment=ft.Alignment.CENTER, expand=True)
+            ft.SafeArea(
+                content=ft.Container(content=card, alignment=ft.Alignment.CENTER, expand=True),
+                expand=True,
+            )
         ],
         bgcolor=BG,
     )
@@ -190,7 +204,11 @@ def _book_tile(ctx: Ctx, review: Review, cover: bytes | None) -> ft.Control:
 
     if cover:
         face = ft.Image(
-            src=cover, width=BOOK_W, height=BOOK_H, fit=ft.BoxFit.COVER, border_radius=6
+            src=_thumb(cover, BOOK_W * 3, BOOK_H * 3),
+            width=BOOK_W,
+            height=BOOK_H,
+            fit=ft.BoxFit.COVER,
+            border_radius=6,
         )
     else:
         face = ft.Container(
@@ -411,9 +429,12 @@ def build_library(ctx: Ctx) -> ft.View:
     return ft.View(
         route="/",
         controls=[
-            ft.Container(
-                content=ft.Column(content, scroll=ft.ScrollMode.AUTO, expand=True),
-                padding=ft.Padding.symmetric(vertical=36, horizontal=side_pad),
+            ft.SafeArea(
+                content=ft.Container(
+                    content=ft.Column(content, scroll=ft.ScrollMode.AUTO, expand=True),
+                    padding=ft.Padding.symmetric(vertical=24 if narrow else 36, horizontal=side_pad),
+                    expand=True,
+                ),
                 expand=True,
             )
         ],
@@ -439,7 +460,7 @@ def build_picker(ctx: Ctx) -> ft.View:
 
     cards = []
     for key, spec in TEMPLATES.items():
-        thumb = renderer.blank_template_png(key, scale=0.21)
+        thumb = renderer.blank_template_jpeg(key)
         cards.append(
             ft.Container(
                 content=ft.Column(
@@ -470,27 +491,30 @@ def build_picker(ctx: Ctx) -> ft.View:
     return ft.View(
         route="/templates",
         controls=[
-            ft.Container(
-                content=ft.Column(
-                    [
-                        ft.Row(
-                            [
-                                ft.IconButton(
-                                    ft.Icons.ARROW_BACK, icon_color=MUTED, on_click=lambda e: page.go("/")
-                                ),
-                                heading("Pick a template"),
-                            ],
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        ),
-                        body_text("Each genre has its own palette and mood — the layout stays the same.", 14, MUTED),
-                        ft.Container(height=18),
-                        ft.Row(cards, wrap=True, spacing=22, run_spacing=22),
-                    ],
-                    scroll=ft.ScrollMode.AUTO,
+            ft.SafeArea(
+                content=ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Row(
+                                [
+                                    ft.IconButton(
+                                        ft.Icons.ARROW_BACK, icon_color=MUTED, on_click=lambda e: page.go("/")
+                                    ),
+                                    heading("Pick a template"),
+                                ],
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            ),
+                            body_text("Each genre has its own palette and mood — the layout stays the same.", 14, MUTED),
+                            ft.Container(height=18),
+                            ft.Row(cards, wrap=True, spacing=22, run_spacing=22),
+                        ],
+                        scroll=ft.ScrollMode.AUTO,
+                        expand=True,
+                    ),
+                    padding=ft.Padding.symmetric(
+                        vertical=24, horizontal=20 if (page.width or 1100) < 640 else 48
+                    ),
                     expand=True,
-                ),
-                padding=ft.Padding.symmetric(
-                    vertical=36, horizontal=20 if (page.width or 1100) < 640 else 48
                 ),
                 expand=True,
             )
@@ -520,23 +544,28 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
 
     spec = get_template(review.template_key)
     dirty = {"changed": is_new, "slots": set()}
+    narrow = (page.width or 1100) < 900
 
     # --- live preview ------------------------------------------------------
+    # JPEG keeps every update ~10x smaller than PNG — matters a lot on phones
+    preview_scale = 0.45 if narrow else 0.5
     preview = ft.Image(
-        src=renderer.render_png(review, images, scale=0.5),
+        src=renderer.render_jpeg(review, images, scale=preview_scale),
         width=min(410, (page.width or 1100) - 56),
         border_radius=10,
         gapless_playback=True,
     )
     render_seq = {"n": 0}
 
-    async def refresh_preview(delay: float = 0.3):
+    async def refresh_preview(delay: float = 0.45):
         render_seq["n"] += 1
         mine = render_seq["n"]
         await asyncio.sleep(delay)
         if mine != render_seq["n"]:
             return
-        preview.src = await asyncio.to_thread(renderer.render_png, review, images, 0.5)
+        preview.src = await asyncio.to_thread(
+            renderer.render_jpeg, review, images, preview_scale
+        )
         preview.update()
 
     def mark_dirty():
@@ -576,17 +605,21 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
     rating_label = body_text(f"{review.rating:g} / 5", 14, MUTED)
 
     async def on_rating(e):
+        # fires on every tick of a drag: update the cheap star icons only
         review.rating = round(float(e.control.value) * 2) / 2
         stars_row.controls = rating_icons(review.rating, spec.accent)
         rating_label.value = f"{review.rating:g} / 5"
         stars_row.update()
         rating_label.update()
         mark_dirty()
-        await refresh_preview(0.05)
+
+    async def on_rating_end(e):
+        await refresh_preview(0.1)
 
     rating_slider = ft.Slider(
         value=review.rating, min=0, max=5, divisions=10,
-        active_color=spec.accent, on_change=on_rating, width=260,
+        active_color=spec.accent, on_change=on_rating,
+        on_change_end=on_rating_end, width=260,
     )
 
     # --- template switcher ---------------------------------------------------
@@ -601,7 +634,7 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
         rating_slider.active_color = spec.accent
         stars_row.update()
         rating_slider.update()
-        await refresh_preview(0.05)
+        await refresh_preview(0.15)
 
     template_dd = ft.Dropdown(
         label="Template",
@@ -620,7 +653,13 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
         if data:
             return ft.Stack(
                 [
-                    ft.Image(src=data, width=w, height=h, fit=ft.BoxFit.COVER, border_radius=8),
+                    ft.Image(
+                        src=_thumb(data, w * 3, h * 3),
+                        width=w,
+                        height=h,
+                        fit=ft.BoxFit.COVER,
+                        border_radius=8,
+                    ),
                     ft.Container(
                         content=ft.IconButton(
                             ft.Icons.CLOSE,
@@ -671,7 +710,7 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
             dirty["slots"].add(slot)
             mark_dirty()
             refresh_slot(slot)
-            await refresh_preview(0.05)
+            await refresh_preview(0.15)
 
         return handler
 
@@ -681,7 +720,7 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
             dirty["slots"].add(slot)
             mark_dirty()
             refresh_slot(slot)
-            await refresh_preview(0.05)
+            await refresh_preview(0.15)
 
         return handler
 
@@ -786,95 +825,119 @@ def build_editor(ctx: Ctx, rid: str) -> ft.View | None:
             ctx.drafts.pop(rid, None)
             page.go("/")
 
-    form = ft.Column(
+    form_children = [
+        ft.Row(
+            [
+                ft.IconButton(ft.Icons.ARROW_BACK, icon_color=MUTED, on_click=go_back),
+                heading("New review" if is_new else "Edit review", 26),
+                ft.Container(expand=True),
+                saved_note,
+            ],
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        ft.Container(height=8),
+        template_dd,
+        ft.Container(height=4),
+        title_f,
+        author_f,
+        ft.Row([pages_f, days_f], spacing=12),
+        ft.Container(height=8),
+        body_text("MY RATING", 12, MUTED),
+        ft.Row([stars_row, rating_label], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        rating_slider,
+        ft.Container(height=8),
+        review_f,
+        ft.Container(height=10),
+        ft.Row(
+            [
+                ft.Column([body_text("COVER", 12, MUTED), cover_tile], spacing=6, tight=True),
+                ft.Column(
+                    [body_text("THE AESTHETIC", 12, MUTED), mood_tiles], spacing=6, tight=True
+                ),
+            ],
+            wrap=True,
+            spacing=18,
+            run_spacing=14,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        ),
+        ft.Container(height=18),
+        ft.Row(
+            [
+                ft.FilledButton(
+                    "Save to bookshelf",
+                    icon=ft.Icons.BOOKMARK_ADDED_OUTLINED,
+                    bgcolor=MUTED,
+                    color="#FFFFFF",
+                    on_click=do_save,
+                ),
+                ft.OutlinedButton("Export PNG", icon=ft.Icons.IMAGE_OUTLINED, on_click=do_export),
+            ],
+            spacing=12,
+        ),
+    ]
+    preview_block = ft.Column(
         [
-            ft.Row(
-                [
-                    ft.IconButton(ft.Icons.ARROW_BACK, icon_color=MUTED, on_click=go_back),
-                    heading("New review" if is_new else "Edit review", 26),
-                    ft.Container(expand=True),
-                    saved_note,
-                ],
-                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ft.Container(
+                content=preview,
+                border_radius=10,
+                shadow=ft.BoxShadow(blur_radius=14, color="#30000000", offset=ft.Offset(0, 6)),
             ),
-            ft.Container(height=8),
-            template_dd,
-            ft.Container(height=4),
-            title_f,
-            author_f,
-            ft.Row([pages_f, days_f], spacing=12),
-            ft.Container(height=8),
-            body_text("MY RATING", 12, MUTED),
-            ft.Row([stars_row, rating_label], vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            rating_slider,
-            ft.Container(height=8),
-            review_f,
-            ft.Container(height=10),
-            ft.Row(
-                [
-                    ft.Column(
-                        [body_text("COVER", 12, MUTED), cover_tile], spacing=6, tight=True
-                    ),
-                    ft.Column(
-                        [body_text("THE AESTHETIC", 12, MUTED), mood_tiles], spacing=6, tight=True
-                    ),
-                ],
-                wrap=True,
-                spacing=18,
-                run_spacing=14,
-                vertical_alignment=ft.CrossAxisAlignment.START,
-            ),
-            ft.Container(height=18),
-            ft.Row(
-                [
-                    ft.FilledButton(
-                        "Save to bookshelf",
-                        icon=ft.Icons.BOOKMARK_ADDED_OUTLINED,
-                        bgcolor=MUTED,
-                        color="#FFFFFF",
-                        on_click=do_save,
-                    ),
-                    ft.OutlinedButton("Export PNG", icon=ft.Icons.IMAGE_OUTLINED, on_click=do_export),
-                ],
-                spacing=12,
-            ),
-            ft.Container(height=30),
+            ft.Container(height=6),
+            body_text("Live preview — exports at 1080 × 1920", 12, MUTED),
         ],
-        scroll=ft.ScrollMode.AUTO,
-        spacing=10,
-        col={"sm": 12, "md": 6, "lg": 5},
+        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        tight=True,
     )
 
-    preview_panel = ft.Container(
-        content=ft.Column(
-            [
-                ft.Container(
-                    content=preview,
-                    border_radius=10,
-                    shadow=ft.BoxShadow(blur_radius=14, color="#30000000", offset=ft.Offset(0, 6)),
-                ),
+    if narrow:
+        # phones: ONE scrollable column — nested scroll areas trap touch
+        # gestures on iOS Safari
+        body = ft.Column(
+            form_children
+            + [
+                ft.Divider(height=28, color="#E2D5C3"),
+                body_text("PREVIEW", 12, MUTED),
                 ft.Container(height=6),
-                body_text("Live preview — exports at 1080 × 1920", 12, MUTED),
+                preview_block,
+                ft.Container(height=40),
             ],
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             scroll=ft.ScrollMode.AUTO,
-        ),
-        alignment=ft.Alignment.TOP_CENTER,
-        padding=ft.Padding.only(left=10, top=16, bottom=16),
-        col={"sm": 12, "md": 6, "lg": 7},
-    )
+            spacing=10,
+            expand=True,
+        )
+    else:
+        form = ft.Column(
+            form_children + [ft.Container(height=30)],
+            scroll=ft.ScrollMode.AUTO,
+            spacing=10,
+            col={"md": 6, "lg": 5},
+        )
+        preview_panel = ft.Container(
+            content=ft.Column(
+                [preview_block],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                scroll=ft.ScrollMode.AUTO,
+            ),
+            alignment=ft.Alignment.TOP_CENTER,
+            padding=ft.Padding.only(left=10, top=16, bottom=16),
+            col={"md": 6, "lg": 7},
+        )
+        body = ft.ResponsiveRow(
+            [form, preview_panel],
+            expand=True,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        )
 
     return ft.View(
         route=f"/edit/{rid}",
         controls=[
-            ft.Container(
-                content=ft.ResponsiveRow(
-                    [form, preview_panel],
+            ft.SafeArea(
+                content=ft.Container(
+                    content=body,
+                    padding=ft.Padding.symmetric(
+                        vertical=16 if narrow else 24, horizontal=16 if narrow else 40
+                    ),
                     expand=True,
-                    vertical_alignment=ft.CrossAxisAlignment.START,
-                ),
-                padding=ft.Padding.symmetric(
-                    vertical=24, horizontal=16 if (page.width or 1100) < 640 else 40
                 ),
                 expand=True,
             )

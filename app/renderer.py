@@ -508,6 +508,26 @@ def render_png(review: Review, images: dict[str, bytes | None] | None = None, sc
     return buf.getvalue()
 
 
+def render_jpeg(
+    review: Review,
+    images: dict[str, bytes | None] | None = None,
+    scale: float = 0.5,
+    quality: int = 82,
+) -> bytes:
+    """Small preview encoding — ~10x lighter than PNG for the live editor."""
+    buf = io.BytesIO()
+    render_review(review, images, scale).save(buf, "JPEG", quality=quality)
+    return buf.getvalue()
+
+
 def blank_template_png(key: str, scale: float = 0.22) -> bytes:
     """Small preview of an empty template (for the picker)."""
     return render_png(Review.new(key), None, scale)
+
+
+@lru_cache(maxsize=16)
+def blank_template_jpeg(key: str, scale: float = 0.21) -> bytes:
+    """Cached lightweight picker thumbnail."""
+    buf = io.BytesIO()
+    render_review(Review.new(key), None, scale).save(buf, "JPEG", quality=85)
+    return buf.getvalue()
