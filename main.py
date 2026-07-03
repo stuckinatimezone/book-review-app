@@ -1,14 +1,17 @@
 """Book Review App — entry point.
 
-Run locally (desktop window):   python main.py
-Run as a web app:               PORT=8550 python main.py
-Railway runs it the same way (PORT is provided by the platform).
+Desktop window (Mac / Windows / Linux):   python main.py
+Serve on your network (phones/tablets):   python main.py --serve [--port 8550]
+Railway / any cloud host:                 starts automatically in web mode
+                                          (the platform sets the PORT variable)
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
+import socket
 import threading
 
 from pathlib import Path
@@ -98,10 +101,49 @@ async def main(page: ft.Page):
     await route_change()
 
 
+def _lan_ip() -> str:
+    """Best-effort local network address, for phones on the same wifi."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))  # no traffic is sent; just picks the route
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT") or 0)
-    if port:
+    parser = argparse.ArgumentParser(description="Book Review App")
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="run as a web server instead of a desktop window "
+        "(so phones/tablets on your network can use it)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("PORT") or 8550),
+        help="port for --serve mode (default: $PORT or 8550)",
+    )
+    args = parser.parse_args()
+
+    # Cloud platforms (Railway, etc.) set PORT — that implies web mode.
+    serve = args.serve or bool(os.getenv("PORT"))
+    if serve:
         os.environ.setdefault("FLET_FORCE_WEB_SERVER", "true")
-        ft.run(main, host="0.0.0.0", port=port, view=ft.AppView.WEB_BROWSER, assets_dir="assets")
+        if not os.getenv("PORT"):  # started by hand, not by a cloud platform
+            print("Book Review App is serving:", flush=True)
+            print(f"  on this computer:      http://localhost:{args.port}", flush=True)
+            print(f"  on phones (same wifi): http://{_lan_ip()}:{args.port}", flush=True)
+            print("Press Ctrl+C to stop.", flush=True)
+        ft.run(
+            main,
+            host="0.0.0.0",
+            port=args.port,
+            view=ft.AppView.WEB_BROWSER,
+            assets_dir="assets",
+        )
     else:
         ft.run(main, assets_dir="assets")

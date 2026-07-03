@@ -1,5 +1,7 @@
 flet==0.85.3
 flet-web==0.85.3
+# desktop window runtime — only needed on Mac/Windows, skipped on cloud hosts
+flet-desktop==0.85.3; sys_platform == "darwin" or sys_platform == "win32"
 pillow==12.3.0
 pillow-heif==1.4.0
 httpx==0.28.1

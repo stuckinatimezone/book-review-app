@@ -21,21 +21,50 @@ for storage (with a local SQLite fallback).
 | `assets/fonts/` | Gelasio + Karla (bundled, used by both UI and renderer) |
 | `supabase_schema.sql` | One-time Supabase table setup (see below) |
 
-## Running on your Mac
+## Hosting — works the same everywhere
+
+All reviews and images live in Supabase, so you can switch between hosts at any time and
+your library follows you. Every host serves every device (iPhone, Android, Mac, Windows —
+anything with a browser).
+
+| You want | Do this |
+|---|---|
+| Use it on the computer in front of you | `python main.py` (native desktop window, Mac or Windows) |
+| Host it from your Mac/Windows PC for your phone | `python main.py --serve` and open the printed wifi URL on the phone |
+| Host it in the cloud (works from anywhere) | Deploy to Railway (below) |
+
+### First-time setup on any computer (Mac or Windows)
 
 ```bash
-source .venv/bin/activate
-python main.py            # opens the native desktop window
+# Mac
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Windows (PowerShell)
+py -m venv .venv ; .venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
-Configuration lives in `.env` (already set up, and git-ignored — never commit it):
+Then copy `.env.example` to `.env` and fill in your Supabase details. Configuration:
 
 - `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` — your Supabase project
-- `STORAGE_BACKEND` — `auto` (default), `supabase`, or `local`
+- `STORAGE_BACKEND` — `supabase` (recommended so every host shares one library),
+  `local`, or `auto` (Supabase when reachable, otherwise this device)
 - `APP_PASSWORD` — set a password to require login; empty = no login screen
 
-With `auto`, the app uses Supabase when it's reachable and set up, otherwise it saves to a
-local database on the device (`~/Library/Application Support/BookReviewApp` on Mac).
+### Hosting from your own computer for your phone
+
+```bash
+python main.py --serve            # add --port 9000 to pick another port
+```
+
+It prints two addresses — open the "phones (same wifi)" one in Safari/Chrome on the phone.
+Notes:
+
+- Phone and computer must be on the same wifi network.
+- macOS will ask "allow incoming network connections?" the first time — click Allow.
+  On Windows, allow it through Windows Defender Firewall if prompted.
+- The computer must stay awake while you're using it from the phone.
 
 ## One-time Supabase setup
 
@@ -62,9 +91,10 @@ sees it.
 
 ## Using it on iPhone / Android
 
-The simplest path: open your Railway URL in Safari/Chrome on the phone and use
-**Share → Add to Home Screen**. You get a full-screen app icon backed by the same Supabase
-library as the Mac app — reviews stay in sync because both talk to the same database.
+Open the app URL (Railway domain, or the wifi URL when hosting from your own computer) in
+Safari/Chrome and use **Share → Add to Home Screen** (Android: menu → **Add to Home
+screen**). You get a full-screen app icon backed by the same Supabase library as every
+other device — reviews stay in sync because everything talks to the same database.
 
 For a fully native install later (no server needed), Flet supports packaging the same code
 as an iOS/Android app with `flet build ipa` / `flet build apk` — that route needs Xcode /
